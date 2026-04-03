@@ -1,4 +1,4 @@
-from .replay_inputs import dump_inputs, replay_inputs
+from .replay import dump_inputs, replay_inputs
 
 __all__ = [
     "dump_inputs",
