@@ -70,6 +70,12 @@ def dump_inputs(
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # If a function is decorated with both @dump_inputs and @replay_inputs,
+            # enable TRITONX_DISABLE_DUMP=1 during replay to skip dumping and avoid
+            # affecting benchmark result.
+            if os.getenv("TRITONX_DISABLE_DUMP", "0") == "1":
+                return func(*args, **kwargs)
+
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
             bound_args = dict(bound.arguments)
