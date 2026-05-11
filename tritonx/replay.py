@@ -68,6 +68,12 @@ def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True):
         return x
 
 
+def get_func_name(func) -> str:
+    if func.__name__ == 'forward' and hasattr(func, '__qualname__'):
+        return func.__qualname__
+    return func.__name__
+
+
 def dump_inputs(
     fn: Optional[Callable] = None,
     *,
@@ -93,16 +99,18 @@ def dump_inputs(
 
             dump_dir = _get_dump_dir()
             Path(dump_dir).mkdir(parents=True, exist_ok=True)
-            file_path = os.path.join(dump_dir, f"{func.__name__}-{sha}.pt")
+            func_name = get_func_name(func)
+            file_path = os.path.join(dump_dir, f"{func_name}-{sha}.pt")
 
             if overwrite or not os.path.exists(file_path):
                 torch.save(
                     {
-                        "func_name": func.__name__,
+                        "func_name": func_name,
                         "inputs": {k: _to_savable_obj(v, move_tensor_to_cpu) for k, v in bound_args.items()},
                     },
                     file_path,
                 )
+                print(f"Dump inputs of {func_name} to {file_path}")
 
             return func(*args, **kwargs)
 
@@ -137,7 +145,7 @@ def replay_inputs(
     benchmark: bool = True,
 ):
     def decorator(func):
-        func_name = func.__name__
+        func_name = get_func_name(func)
 
         def _iter_case_paths(hash_prefix: str = None) -> List[Path]:
             cache_dir = _get_dump_dir()
@@ -211,6 +219,7 @@ def replay_inputs(
                 if strict_func_name and obj.get("func_name") != func_name:
                     continue
                 inputs = _move_to_device(obj["inputs"], device_override if device_override is not None else device)
+                print(f"Replaying {func_name} with inputs from {f}")
                 result = func(**inputs)
                 results.append(
                     {
