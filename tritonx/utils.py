@@ -2,7 +2,7 @@ import triton
 import torch
 
 
-_DTYPE_ABBR = {
+TORCH_DTYPE_TO_DTYPE = {
     torch.float32: "f32",
     torch.float: "f32",
     torch.float16: "f16",
@@ -10,6 +10,8 @@ _DTYPE_ABBR = {
     torch.bfloat16: "bf16",
     torch.float64: "f64",
     torch.double: "f64",
+    torch.float8_e4m3fn: "f8_e4m3fn",
+    torch.float8_e5m2: "f8_e5m2",
     torch.int8: "i8",
     torch.int16: "i16",
     torch.int32: "i32",
@@ -20,9 +22,25 @@ _DTYPE_ABBR = {
 }
 
 
+DTYPE_TO_TORCH_DTYPE = {
+    "f32": torch.float32,
+    "f16": torch.float16,
+    "bf16": torch.bfloat16,
+    "f64": torch.float64,
+    "f8_e4m3fn": torch.float8_e4m3fn,
+    "f8_e5m2": torch.float8_e5m2,
+    "i8": torch.int8,
+    "i16": torch.int16,
+    "i32": torch.int32,
+    "i64": torch.int64,
+    "u8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
 def tensor_shape_dtype_str(t: torch.Tensor) -> str:
     shape_part = "x".join(str(d) for d in t.shape)
-    dtype_abbr = _DTYPE_ABBR.get(t.dtype, str(t.dtype))
+    dtype_abbr = TORCH_DTYPE_TO_DTYPE.get(t.dtype, str(t.dtype))
     return f"{shape_part}x{dtype_abbr}"
 
 

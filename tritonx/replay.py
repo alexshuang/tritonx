@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 from triton.runtime.cache import default_dump_dir
 import triton.testing as tt
-from .utils import perf_report
+from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
 
 
 def _get_dump_dir():
@@ -43,8 +43,17 @@ def _compute_inputs_sha256(bound_args: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()[:12]
 
 
+def tensor_type_str(x: torch.Tensor) -> str:
+    shape = "x".join(str(s) for s in x.shape)
+    dtype = TORCH_DTYPE_TO_DTYPE.get(x.dtype, str(x.dtype).replace("torch.", ""))
+    return f"{shape}x{dtype}"
+
+
 def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True):
     if isinstance(x, torch.Tensor):
+        if torch.is_floating_point(x):
+            return tensor_type_str(x)
+
         t = x.detach()
         if move_tensor_to_cpu:
             t = t.cpu()
@@ -105,6 +114,21 @@ def dump_inputs(
         return decorator
 
 
+def tensor_from_type_str(s: str, device="cpu"):
+    shape_part, dtype_part = s.rsplit("x", 1)
+    shape = tuple(int(x) for x in shape_part.split("x"))
+    dtype = DTYPE_TO_TORCH_DTYPE[dtype_part]
+
+    if dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+        return torch.rand(shape, dtype=dtype, device=device)
+
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        x = torch.rand(shape, dtype=torch.float32, device=device)
+        return x.to(dtype)
+
+    raise ValueError(f"Unsupported dtype: {dtype_part}")
+
+
 def replay_inputs(
     fn: Optional[Callable] = None,
     *,
@@ -130,6 +154,8 @@ def replay_inputs(
         def _move_to_device(obj: Any, target_device: str) -> Any:
             if isinstance(obj, torch.Tensor):
                 return obj.to(target_device)
+            if isinstance(obj, str):
+                return tensor_from_type_str(obj, target_device)
             if isinstance(obj, dict):
                 return {k: _move_to_device(v, target_device) for k, v in obj.items()}
             if isinstance(obj, list):
