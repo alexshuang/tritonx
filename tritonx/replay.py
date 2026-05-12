@@ -6,14 +6,23 @@ import inspect
 import functools
 from pathlib import Path
 from typing import Any, Callable, List, Optional
-from triton.runtime.cache import default_dump_dir
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
 
+from triton import __version__ as triton_version
+triton_major_version = int(triton_version.split(".")[0])
+triton_minor_version = int(triton_version.split(".")[1])
+triton_version_float = triton_major_version + float(triton_minor_version / 10)
+
 
 def _get_dump_dir():
-    cache_dir = os.getenv("TRITON_DUMP_DIR", "").strip() or default_dump_dir()
-    return os.path.join(cache_dir, "inputs")
+    if triton_version_float >= 3.3:
+        from triton.knobs import cache as cache_knob
+        dump_dir = os.getenv("TRITON_DUMP_DIR", "").strip() or cache_knob.dump_dir
+    else:
+        from triton.runtime.cache import default_dump_dir
+        dump_dir = os.getenv("TRITON_DUMP_DIR", "").strip() or default_dump_dir()
+    return os.path.join(dump_dir, "inputs")
 
 
 def _to_hashable_obj(x: Any):
@@ -250,6 +259,7 @@ def replay_inputs(
             quantiles: Optional[List[float]] = None,
         ):
             bench_cfgs = _build_benchmark_from_pt()
+            os.makedirs(save_path, exist_ok=True)
 
             @perf_report(bench_cfgs)
             def _bench(**bench_kwargs):
