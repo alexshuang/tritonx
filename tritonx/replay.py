@@ -220,7 +220,7 @@ def replay_inputs(
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
-        def replay_all(device_override=None):
+        def replay_all(device_override=None, ref_fn: Callable = None):
             files = _iter_case_paths()
             results = []
             for f in files:
@@ -230,6 +230,10 @@ def replay_inputs(
                 inputs = _move_to_device(obj["inputs"], device_override if device_override is not None else device)
                 print(f"Replaying {func_name} with inputs from {f}")
                 result = func(**inputs)
+
+                if ref_fn:
+                    ref_fn(result, **inputs)
+
                 results.append(
                     {
                         "file": str(f),
