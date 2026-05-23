@@ -220,37 +220,38 @@ def replay_inputs(
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
+        def _run(file: str, device, ref_fn: Callable = None):
+            obj = torch.load(file, map_location="cpu")
+            # if strict_func_name and obj.get("func_name") != func_name:
+            #     continue
+            inputs = _move_to_device(obj["inputs"], device)
+            print(f"Replaying {os.path.basename(file)} ...")
+            result = func(**inputs)
+
+            if ref_fn:
+                ref_fn(inputs)
+
+            return result
+
         def replay_all(device_override=None, ref_fn: Callable = None):
             files = _iter_case_paths()
             results = []
             for f in files:
-                obj = torch.load(f, map_location="cpu")
-                if strict_func_name and obj.get("func_name") != func_name:
-                    continue
-                inputs = _move_to_device(obj["inputs"], device_override if device_override is not None else device)
-                print(f"Replaying {func_name} with inputs from {f}")
-                result = func(**inputs)
-
-                if ref_fn:
-                    ref_fn(result, **inputs)
-
                 results.append(
                     {
                         "file": str(f),
-                        "result": result,
+                        "result": _run(f,
+                                       device_override if device_override is not None else device,
+                                       ref_fn),
                     }
                 )
             return results
 
-        def replay(hash_prefix: str, device_override=None):
+        def replay(hash_prefix: str, device_override=None, ref_fn: Callable = None):
             files = _iter_case_paths(hash_prefix)
             if len(files) > 1:
                 raise RuntimeError(f"multiple matches for prefix {hash_prefix}: {[str(x) for x in files]}")
-
-            f = files[0]
-            obj = torch.load(f, map_location="cpu")
-            inputs = _move_to_device(obj["inputs"], device_override if device_override is not None else device)
-            return func(**inputs)
+            return _run(files[0], device_override if device_override is not None else device, ref_fn),
 
         def benchmark(
             *,
