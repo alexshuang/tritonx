@@ -1,6 +1,11 @@
 import triton
 import torch
 
+try:
+    from triton.backends.amd.testing import MPMark as _Mark
+except ImportError:
+    from triton.testing import Mark as _Mark
+
 
 TORCH_DTYPE_TO_DTYPE = {
     torch.float32: "f32",
@@ -44,7 +49,7 @@ def tensor_shape_dtype_str(t: torch.Tensor) -> str:
     return f"{shape_part}x{dtype_abbr}"
 
 
-class Mark(triton.testing.Mark):
+class Mark(_Mark):
 
     def _run(self, bench: triton.testing.Benchmark, save_path: str, show_plots: bool, print_data: bool, diff_col=False,
              save_precision=6, **kwrags):
