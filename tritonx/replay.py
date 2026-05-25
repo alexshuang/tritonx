@@ -200,7 +200,7 @@ def replay_inputs(
 
             x_names = keys[0]
             x_vals = vals
-            plot_name = f"Benchmark {func_name}"
+            plot_name = f"{func_name}"
             return tt.Benchmark(
                 x_names=x_names,
                 x_vals=x_vals,
@@ -289,12 +289,21 @@ def replay_inputs(
                 # return tt.do_bench(run, warmup=warmup, rep=rep, quantiles=q)
                 return tt.do_bench(run, quantiles=q)
 
-            return _bench.run(
+            ret = _bench.run(
                 show_plots=show_plots,
                 print_data=print_data,
                 save_path=save_path,
                 return_df=return_df,
             )
+
+            if save_path:
+                print('\n' + '*' * 72)
+                print('*')
+                print(f'*  Benchmark result save path: {os.path.join(save_path, f"{bench_cfgs.plot_name]}.csv")}')
+                print('*')
+                print('*' * 72 + '\n')
+
+            return ret
 
         wrapper.replay_all = replay_all
         wrapper.replay = replay
