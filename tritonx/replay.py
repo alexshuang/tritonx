@@ -299,7 +299,7 @@ def replay_inputs(
             if save_path:
                 print('\n' + '*' * 72)
                 print('*')
-                print(f'*  Benchmark result save path: {os.path.join(save_path, f"{bench_cfgs.plot_name]}.csv")}')
+                print(f'*  Benchmark result save path: {os.path.join(save_path, f"{bench_cfgs.plot_name}.csv")}')
                 print('*')
                 print('*' * 72 + '\n')
 
