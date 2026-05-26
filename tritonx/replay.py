@@ -22,7 +22,15 @@ def _get_dump_dir():
     else:
         from triton.runtime.cache import default_dump_dir
         dump_dir = os.getenv("TRITON_DUMP_DIR", "").strip() or default_dump_dir()
-    return os.path.join(dump_dir, "inputs")
+    return dump_dir
+
+
+def get_dump_input_dir():
+    return os.path.join(_get_dump_dir(), "inputs")
+
+
+def get_dump_output_dir():
+    return os.path.join(_get_dump_dir(), "outputs")
 
 
 def _to_hashable_obj(x: Any):
@@ -90,6 +98,7 @@ def dump_inputs(
     overwrite: bool = False,
 ):
     def decorator(func):
+        torch.manual_seed(42)
         sig = inspect.signature(func)
 
         @functools.wraps(func)
@@ -106,7 +115,7 @@ def dump_inputs(
 
             sha = _compute_inputs_sha256(bound_args)
 
-            dump_dir = _get_dump_dir()
+            dump_dir = get_dump_input_dir()
             Path(dump_dir).mkdir(parents=True, exist_ok=True)
             func_name = get_func_name(func)
             file_path = os.path.join(dump_dir, f"{func_name}-{sha}.pt")
@@ -152,12 +161,14 @@ def replay_inputs(
     device: str ='cuda',
     strict_func_name: bool = True,
     benchmark: bool = True,
+    move_tensor_to_cpu: bool = True,
 ):
     def decorator(func):
+        torch.manual_seed(42)
         func_name = get_func_name(func)
 
         def _iter_case_paths(hash_prefix: str = None) -> List[Path]:
-            cache_dir = _get_dump_dir()
+            cache_dir = get_dump_input_dir()
             root = Path(cache_dir)
             if not root.exists():
                 raise FileNotFoundError(f"cache_dir does not exist: {root}")
@@ -220,20 +231,37 @@ def replay_inputs(
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
-        def _run(file: str, device, ref_fn: Callable = None):
+        def _run(file: str, device, cache_results: list = None, ref_fn: Callable = None):
             obj = torch.load(file, map_location="cpu")
             # if strict_func_name and obj.get("func_name") != func_name:
             #     continue
             inputs = _move_to_device(obj["inputs"], device)
             print(f"Replaying {os.path.basename(file)} ...")
-            result = func(**inputs)
+            ret = func(**inputs)
+
+            if cache_results:
+                if isinstance(cache_results, str):
+                    cache_results = [cache_results]
+                out_args = cache_results
+                dump_dir = get_dump_output_dir()
+                Path(dump_dir).mkdir(parents=True, exist_ok=True)
+                file_path = os.path.join(dump_dir, os.path.basename(file))
+                results = {k: inputs[k].detach().cpu() for k in out_args}
+                torch.save(
+                    {
+                        "func_name": func_name,
+                        "outputs": results,
+                    },
+                    file_path,
+                )
+                print(f"Cache results {cache_results} to {file_path}")
 
             if ref_fn:
-                ref_fn(inputs)
+                ref_fn({'input_file': file, **inputs})
 
-            return result
+            return ret
 
-        def replay_all(device_override=None, ref_fn: Callable = None):
+        def replay_all(device_override=None, cache_results: str = None, ref_fn: Callable = None):
             files = _iter_case_paths()
             results = []
             for f in files:
@@ -242,7 +270,8 @@ def replay_inputs(
                         "file": str(f),
                         "result": _run(f,
                                        device_override if device_override is not None else device,
-                                       ref_fn),
+                                       cache_results=cache_results,
+                                       ref_fn=ref_fn),
                     }
                 )
             return results
@@ -251,7 +280,7 @@ def replay_inputs(
             files = _iter_case_paths(hash_prefix)
             if len(files) > 1:
                 raise RuntimeError(f"multiple matches for prefix {hash_prefix}: {[str(x) for x in files]}")
-            return _run(files[0], device_override if device_override is not None else device, ref_fn),
+            return _run(files[0], device_override if device_override is not None else device, ref_fn=ref_fn)
 
         def benchmark(
             *,
