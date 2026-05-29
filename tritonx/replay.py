@@ -66,21 +66,34 @@ def tensor_type_str(x: torch.Tensor) -> str:
     return f"{shape}x{dtype}"
 
 
-def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True):
+def _make_deterministic_seed(func_name: str, arg_name: str, type_str: str) -> int:
+    key = f"{func_name}::{arg_name}::{type_str}"
+    return int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2**32)
+
+
+class FloatTensor(dict):
+    def __repr__(self):
+        return self.get("type_str")
+
+
+def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True,
+                    func_name: str = "", arg_name: str = ""):
     if isinstance(x, torch.Tensor):
         if torch.is_floating_point(x):
-            return tensor_type_str(x)
+            type_str = tensor_type_str(x)
+            seed = _make_deterministic_seed(func_name, arg_name, type_str)
+            return FloatTensor({"type_str": type_str, "seed": seed})
 
         t = x.detach()
         if move_tensor_to_cpu:
             t = t.cpu()
         return t
     elif isinstance(x, list):
-        return [_to_savable_obj(v, move_tensor_to_cpu) for v in x]
+        return [_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for v in x]
     elif isinstance(x, tuple):
-        return tuple(_to_savable_obj(v, move_tensor_to_cpu) for v in x)
+        return tuple(_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for v in x)
     elif isinstance(x, dict):
-        return {k: _to_savable_obj(v, move_tensor_to_cpu) for k, v in x.items()}
+        return {k: _to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for k, v in x.items()}
     else:
         return x
 
@@ -91,6 +104,10 @@ def get_func_name(func) -> str:
     return func.__name__
 
 
+def is_dump_inputs(func) -> bool:
+    return hasattr(func, '__decorator_name__') and func.__decorator_name__ == 'dump_inputs'
+
+
 def dump_inputs(
     fn: Optional[Callable] = None,
     *,
@@ -98,15 +115,12 @@ def dump_inputs(
     overwrite: bool = False,
 ):
     def decorator(func):
-        torch.manual_seed(42)
         sig = inspect.signature(func)
 
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # If a function is decorated with both @dump_inputs and @replay_inputs,
-            # enable TRITONX_DISABLE_DUMP=1 during replay to skip dumping and avoid
-            # affecting benchmark result.
-            if os.getenv("TRITONX_DISABLE_DUMP", "0") == "1":
+        def wrapper(*args, dump=True, **kwargs):
+            # @replay_inputs don't dump inputs by dump_inputs=False to avoid affecting benchmark
+            if not dump:
                 return func(*args, **kwargs)
 
             bound = sig.bind(*args, **kwargs)
@@ -120,18 +134,25 @@ def dump_inputs(
             func_name = get_func_name(func)
             file_path = os.path.join(dump_dir, f"{func_name}-{sha}.pt")
 
-            if overwrite or not os.path.exists(file_path):
-                torch.save(
-                    {
-                        "func_name": func_name,
-                        "inputs": {k: _to_savable_obj(v, move_tensor_to_cpu) for k, v in bound_args.items()},
+            torch.save(
+                {
+                    "func_name": func_name,
+                    "inputs": {
+                        k: _to_savable_obj(v, move_tensor_to_cpu, func_name, k)
+                        for k, v in bound_args.items()
                     },
-                    file_path,
-                )
-                print(f"Dump inputs of {func_name} to {file_path}")
+                },
+                file_path,
+            )
+            print(f"Dump inputs of {func_name} to {file_path}")
 
             return func(*args, **kwargs)
 
+        wrapper.__decorator_name__ = "dump_inputs"
+        wrapper.__decorator_params__ = {
+            "move_tensor_to_cpu": move_tensor_to_cpu,
+            "overwrite": overwrite,
+        }
         return wrapper
 
     if fn is not None:
@@ -140,19 +161,31 @@ def dump_inputs(
         return decorator
 
 
-def tensor_from_type_str(s: str, device="cpu"):
+def float_tensor_from_type_str(s: str, device="cpu", seed: int = None):
     shape_part, dtype_part = s.rsplit("x", 1)
     shape = tuple(int(x) for x in shape_part.split("x"))
     dtype = DTYPE_TO_TORCH_DTYPE[dtype_part]
 
+    gen = None
+    if seed is not None:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(seed)
+
     if dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
-        return torch.rand(shape, dtype=dtype, device=device)
+        return torch.rand(shape, dtype=dtype, device=device, generator=gen)
 
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        x = torch.rand(shape, dtype=torch.float32, device=device)
+        x = torch.rand(shape, dtype=torch.float32, device=device, generator=gen)
         return x.to(dtype)
 
     raise ValueError(f"Unsupported dtype: {dtype_part}")
+
+
+def tensor_from_type_str(s: str, device="cpu", seed: int = None):
+    dtype = s.split('x')[-1]
+    if dtype.startswith("f") or dtype.startswith("bf"):
+        return float_tensor_from_type_str(s, device, seed)
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def replay_inputs(
@@ -164,7 +197,6 @@ def replay_inputs(
     move_tensor_to_cpu: bool = True,
 ):
     def decorator(func):
-        torch.manual_seed(42)
         func_name = get_func_name(func)
 
         def _iter_case_paths(hash_prefix: str = None) -> List[Path]:
@@ -184,6 +216,9 @@ def replay_inputs(
                 return obj.to(target_device)
             if isinstance(obj, str):
                 return tensor_from_type_str(obj, target_device)
+            if isinstance(obj, FloatTensor):
+                # format: {"type_str": "2x3xf32", "seed": 123}
+                return float_tensor_from_type_str(obj["type_str"], target_device, seed=obj["seed"])
             if isinstance(obj, dict):
                 return {k: _move_to_device(v, target_device) for k, v in obj.items()}
             if isinstance(obj, list):
@@ -203,7 +238,7 @@ def replay_inputs(
 
             keys, vals = [], []
             for f in file_paths:
-                obj = torch.load(f, map_location="cpu")
+                obj = torch.load(f, map_location="cpu", weights_only=False)
                 keys.append(obj['inputs'].keys())
                 vals.append([o for o in obj['inputs'].values()])
 
@@ -229,28 +264,30 @@ def replay_inputs(
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+            return func(*args, dump=False, **kwargs)
 
         def _run(file: str, device, cache_results: list = None, ref_fn: Callable = None):
-            obj = torch.load(file, map_location="cpu")
+            obj = torch.load(file, map_location="cpu", weights_only=False)
             # if strict_func_name and obj.get("func_name") != func_name:
             #     continue
             inputs = _move_to_device(obj["inputs"], device)
             print(f"Replaying {os.path.basename(file)} ...")
-            ret = func(**inputs)
+            if is_dump_inputs(func):
+                ret = func(dump=func.__decorator_params__.get("overwrite"),
+                           **inputs)
+            else:
+                ret = func(**inputs)
 
             if cache_results:
                 if isinstance(cache_results, str):
                     cache_results = [cache_results]
-                out_args = cache_results
                 dump_dir = get_dump_output_dir()
                 Path(dump_dir).mkdir(parents=True, exist_ok=True)
                 file_path = os.path.join(dump_dir, os.path.basename(file))
-                results = {k: inputs[k].detach().cpu() for k in out_args}
                 torch.save(
                     {
                         "func_name": func_name,
-                        "outputs": results,
+                        "outputs": {k: inputs[k].detach().cpu() for k in cache_results},
                     },
                     file_path,
                 )
@@ -308,7 +345,7 @@ def replay_inputs(
                         f"Benchmark device mismatch: expected {device!r}, got {runtime_device!r}"
                     )
 
-                run = lambda: func(**inputs)
+                run = lambda: func(dump=False, **inputs) if is_dump_inputs(func) else func(**inputs)
 
                 if quantiles is None:
                     q = [0.5, 0.2, 0.8]
@@ -337,6 +374,7 @@ def replay_inputs(
         wrapper.replay_all = replay_all
         wrapper.replay = replay
         wrapper.benchmark = benchmark
+        wrapper.__decorator_name__ = "replay_inputs"
         return wrapper
 
     if fn is not None:

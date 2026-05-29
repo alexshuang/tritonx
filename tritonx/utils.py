@@ -84,7 +84,11 @@ class Mark(_Mark):
                 row_mean += [y_mean]
                 row_min += [y_min]
                 row_max += [y_max]
-            _x = [tensor_shape_dtype_str(o) if hasattr(o, 'dtype') else o for o in x]
+
+            from .replay import FloatTensor
+            _x = [tensor_shape_dtype_str(o) if hasattr(o, 'dtype') else
+                  o.get('type_str') if isinstance(o, FloatTensor) else o
+                  for o in x]
             df.loc[len(df)] = [pt.stem] + _x + row_mean + row_min + row_max
 
         # NYI:
