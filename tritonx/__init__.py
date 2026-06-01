@@ -5,3 +5,14 @@ __all__ = [
     "replay_inputs",
     "get_dump_output_dir",
 ]
+
+
+def _launch_metadata(grid, kernel, args):
+    return {
+        'grid': grid,
+        'args': args,
+    }
+
+import functools
+import triton
+triton.jit = functools.partial(triton.jit, launch_metadata=_launch_metadata)

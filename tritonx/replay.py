@@ -1,12 +1,14 @@
 import os
 import json
 import torch
+import triton
 import hashlib
 import inspect
 import functools
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
+from collections import defaultdict
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
 
@@ -272,6 +274,69 @@ def tensor_from_type_str(s: str, device="cpu", seed: int = None):
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+def next_power_of_2(x):
+    if x < 1:
+        return 1
+    return 1 << (x - 1).bit_length()
+
+
+def prev_power_of_2(x):
+    if x < 1:
+        return 1
+    return 1 << (x.bit_length() - 1)
+
+
+def p2_reduce_dim_vals(vals: list[int]) -> set[int]:
+    """ power-of-2 """
+    vals = sorted(vals)
+    min_val, max_val = vals[0], vals[-1]
+    kept = {min_val, max_val}
+
+    p = prev_power_of_2(min_val)
+    while p <= max_val:
+        if p in vals:
+            kept.add(p)
+        else:
+            kept.add(min(vals, key=lambda v: abs(v - p)))
+        p *= 2
+
+    return kept
+
+
+def prune_grids(grids: list[tuple], threshold: int = 10, mode='next_power_of_2') -> list[tuple]:
+    # Step 1: unique
+    unique_grids = list(dict.fromkeys(grids))
+    ndim = len(unique_grids[0])
+
+    # Step 2: find the dimensions that vary significantly (number of distinct values > threshold)
+    vary_dims = set(
+        d for d in range(ndim)
+        if len(set(g[d] for g in unique_grids)) > threshold
+    )
+
+    # Step 3: For each varying dimension, group by the prefix key and reduce the values
+     # Filter dimension by dimension, reducing the grid set in each round
+    current_grids = set(unique_grids)
+
+    for vary_dim in sorted(vary_dims):
+        groups = defaultdict(set)
+        for g in current_grids:
+            key = tuple(g[d] for d in range(ndim) if d != vary_dim)
+            groups[key].add(g[vary_dim])
+
+        next_grids = set()
+        for key, vary_vals in groups.items():
+            kept_vals = p2_reduce_dim_vals(sorted(vary_vals))
+            for v in kept_vals:
+                g = list(key)
+                g.insert(vary_dim, v)
+                next_grids.add(tuple(g))
+
+        current_grids = next_grids
+
+    return sorted(current_grids)
+
+
 def replay_inputs(
     fn: Optional[Callable] = None,
     *,
@@ -282,6 +347,15 @@ def replay_inputs(
 ):
     def decorator(func):
         func_name = get_func_name(func)
+        _user_hooks = []
+
+        def add_user_hook(hook):
+            if hook not in _user_hooks:
+                _user_hooks.append(hook)
+
+        def remove_user_hook(hook):
+            if hook in _user_hooks:
+                _user_hooks.remove(hook)
 
         def _iter_case_paths(hash_prefix: str = None) -> List[Path]:
             cache_dir = get_dump_input_dir()
@@ -313,8 +387,9 @@ def replay_inputs(
                 return tuple(_move_to_device(v, target_device) for v in obj)
             return obj
 
-        def _build_benchmark_from_pt() -> tt.Benchmark:
-            file_paths = _iter_case_paths()
+        def _build_benchmark_from_pt(pt_manifest: str = '') -> tt.Benchmark:
+            file_paths = [Path(o) for o in open(pt_manifest).read().splitlines()] \
+                if pt_manifest else _iter_case_paths()
 
             def is_same_argument_names(lists: list[list[str]]) -> bool:
                 if not lists:
@@ -333,6 +408,7 @@ def replay_inputs(
             x_names = keys[0]
             x_vals = vals
             plot_name = f"{func_name}"
+            print(f"Benchmarking {func_name} with {len(file_paths)} cases")
             return tt.Benchmark(
                 x_names=x_names,
                 x_vals=x_vals,
@@ -350,9 +426,25 @@ def replay_inputs(
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            return func(*args, dump=False, **kwargs)
+            fn = lambda: func(*args, dump=False, **kwargs) if is_dump_inputs(func) else func(*args, **kwargs)
+            return fn()
 
         def _run(file: str, device, cache_results: list = None, ref_fn: Callable = None):
+            def _launch_enter_hook(launch_metadata):
+                metadata = launch_metadata.get() | {'input_file': file}
+                for h in _user_hooks:
+                    h(metadata)
+
+            add_hook = True if _user_hooks else False
+
+            if add_hook:
+                if triton_version_float >= 3.5:
+                    triton.knobs.runtime.launch_enter_hook.add(_launch_enter_hook)
+                elif triton_version_float >= 3.4:
+                    triton.knobs.runtime.launch_enter_hook = _launch_enter_hook
+                else:
+                    triton.compiler.CompiledKernel.launch_enter_hook = _launch_enter_hook
+
             obj = torch.load(file, map_location="cpu", weights_only=False)
             # if strict_func_name and obj.get("func_name") != func_name:
             #     continue
@@ -363,6 +455,14 @@ def replay_inputs(
                            **inputs)
             else:
                 ret = func(**inputs)
+
+            if add_hook:
+                if triton_version_float >= 3.5:
+                    triton.knobs.runtime.launch_enter_hook.remove(_launch_enter_hook)
+                elif triton_version_float >= 3.4:
+                    triton.knobs.runtime.launch_enter_hook = None
+                else:
+                    triton.compiler.CompiledKernel.launch_enter_hook = None
 
             if cache_results:
                 if isinstance(cache_results, str):
@@ -384,19 +484,20 @@ def replay_inputs(
 
             return ret
 
-        def replay_all(device_override=None, cache_results: str = None, ref_fn: Callable = None):
+        def replay_all(device_override=None, cache_results: str = None, ref_fn: Callable = None,
+                       replay_enter_hook: Callable = None):
             files = _iter_case_paths()
-            results = []
-            for f in files:
-                results.append(
-                    {
-                        "file": str(f),
-                        "result": _run(f,
-                                       device_override if device_override is not None else device,
-                                       cache_results=cache_results,
-                                       ref_fn=ref_fn),
-                    }
-                )
+            if replay_enter_hook:
+                add_user_hook(replay_enter_hook)
+            results = [
+                {
+                    "file": str(f),
+                    "result": _run(f,
+                                    device_override if device_override is not None else device,
+                                    cache_results=cache_results,
+                                    ref_fn=ref_fn),
+                } for f in files
+            ]
             return results
 
         def replay(hash_prefix: str, device_override=None, ref_fn: Callable = None):
@@ -404,6 +505,31 @@ def replay_inputs(
             if len(files) > 1:
                 raise RuntimeError(f"multiple matches for prefix {hash_prefix}: {[str(x) for x in files]}")
             return _run(files[0], device_override if device_override is not None else device, ref_fn=ref_fn)
+
+        def get_grids_by_key(keys: list):
+            grids = defaultdict(set)
+            def _hook(metadata):
+                args = metadata['args']
+                key = tuple([str(args[o].dtype) if hasattr(args[o], 'dtype') else args[o]
+                            for o in keys if o in args])
+                grids[key].add((metadata['input_file'], metadata['grid']))
+
+            replay_all(replay_enter_hook=_hook)
+            return grids
+
+        def prune_files_by_grids(key: list, mode='next_power_of_2'):
+            res = {}
+            for k, v in get_grids_by_key(key).items():
+                files, grids = zip(*v)
+
+                indices = defaultdict(list)
+                for idx, g in enumerate(grids):
+                    indices[g].append(idx)
+
+                pruned = prune_grids(grids, mode=mode)
+                pruned_indices = [indices.get(grid, [])[0] for grid in pruned]
+                res[k] = [(files[i], grids[i]) for i in pruned_indices]
+            return res
 
         def benchmark(
             *,
@@ -414,8 +540,9 @@ def replay_inputs(
             warmup: int = 25,
             rep: int = 100,
             quantiles: Optional[List[float]] = None,
+            pt_manifest: str = '',
         ):
-            bench_cfgs = _build_benchmark_from_pt()
+            bench_cfgs = _build_benchmark_from_pt(pt_manifest=pt_manifest)
             os.makedirs(save_path, exist_ok=True)
 
             @perf_report(bench_cfgs)
@@ -460,6 +587,8 @@ def replay_inputs(
         wrapper.replay_all = replay_all
         wrapper.replay = replay
         wrapper.benchmark = benchmark
+        wrapper.get_grids_by_key = get_grids_by_key
+        wrapper.prune_files_by_grids = prune_files_by_grids
         wrapper.__decorator_name__ = "replay_inputs"
         return wrapper
 
