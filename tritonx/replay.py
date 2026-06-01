@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import functools
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
@@ -76,6 +77,59 @@ class FloatTensor(dict):
         return self.get("type_str")
 
 
+def all_scalars_equal(x: torch.Tensor):
+    u = torch.unique(x)
+    if u.numel() == 1:
+        return True, u.item()
+    else:
+        return False, None
+
+
+@dataclass
+class CSRMask:
+    length: int
+    indptr: torch.Tensor  # shape: (num_segments * 2,), [start, end)
+
+    @classmethod
+    def from_mask(cls, mask: torch.Tensor) -> "CSRMask":
+        assert mask.dtype == torch.bool and mask.dim() == 1
+
+        padded = torch.cat([
+            torch.tensor([False]),
+            mask.detach().cpu(),
+            torch.tensor([False])
+        ])
+        diff = padded[1:].int() - padded[:-1].int()
+        starts = (diff == 1).nonzero(as_tuple=True)[0]
+        ends   = (diff == -1).nonzero(as_tuple=True)[0]
+
+        indptr = torch.stack([starts, ends], dim=1).flatten()
+        return cls(length=mask.shape[0], indptr=indptr)
+
+    def to_mask(self) -> torch.Tensor:
+        mask = torch.zeros(self.length, dtype=torch.bool)
+        for start, end in self.indptr.reshape(-1, 2):
+            mask[start:end] = True
+        return mask
+
+    @property
+    def num_segments(self) -> int:
+        return self.indptr.shape[0] // 2
+
+    @property
+    def num_true(self) -> int:
+        pairs = self.indptr.reshape(-1, 2)
+        return int((pairs[:, 1] - pairs[:, 0]).sum())
+
+    def __repr__(self) -> str:
+        pairs = self.indptr.reshape(-1, 2).tolist()
+        segs = ", ".join(f"[{s},{e})" for s, e in pairs)
+        return (f"CSRMask(length={self.length}, "
+                f"num_segments={self.num_segments}, "
+                f"num_true={self.num_true}, "
+                f"segments=[{segs}])")
+
+
 def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True,
                     func_name: str = "", arg_name: str = ""):
     if isinstance(x, torch.Tensor):
@@ -83,6 +137,15 @@ def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True,
             type_str = tensor_type_str(x)
             seed = _make_deterministic_seed(func_name, arg_name, type_str)
             return FloatTensor({"type_str": type_str, "seed": seed})
+        else:
+            # all same scalar
+            u = torch.unique(x)
+            if u.numel() == 1:
+                return f"{tensor_type_str(x)}={u.item()}"
+
+            # compress by CSR format
+            if x.dtype == torch.bool and x.dim() == 1:
+                return CSRMask.from_mask(x)
 
         t = x.detach()
         if move_tensor_to_cpu:
@@ -161,10 +224,15 @@ def dump_inputs(
         return decorator
 
 
-def float_tensor_from_type_str(s: str, device="cpu", seed: int = None):
+def parse_type(s: str):
     shape_part, dtype_part = s.rsplit("x", 1)
     shape = tuple(int(x) for x in shape_part.split("x"))
     dtype = DTYPE_TO_TORCH_DTYPE[dtype_part]
+    return shape, dtype
+
+
+def float_tensor_from_type_str(s: str, device="cpu", seed: int = None):
+    shape, dtype = parse_type(s)
 
     gen = None
     if seed is not None:
@@ -178,13 +246,18 @@ def float_tensor_from_type_str(s: str, device="cpu", seed: int = None):
         x = torch.rand(shape, dtype=torch.float32, device=device, generator=gen)
         return x.to(dtype)
 
-    raise ValueError(f"Unsupported dtype: {dtype_part}")
+    raise ValueError(f"Unsupported dtype: {s.split('x')[-1]}")
 
 
 def tensor_from_type_str(s: str, device="cpu", seed: int = None):
     dtype = s.split('x')[-1]
     if dtype.startswith("f") or dtype.startswith("bf"):
         return float_tensor_from_type_str(s, device, seed)
+    elif '=' in dtype:
+        type_str, value_str = s.split('=')
+        shape, dtype = parse_type(type_str)
+        return torch.full(shape, eval(value_str), dtype=dtype).to(device)
+
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
@@ -219,6 +292,8 @@ def replay_inputs(
             if isinstance(obj, FloatTensor):
                 # format: {"type_str": "2x3xf32", "seed": 123}
                 return float_tensor_from_type_str(obj["type_str"], target_device, seed=obj["seed"])
+            if isinstance(obj, CSRMask):
+                return obj.to_mask().to(target_device)
             if isinstance(obj, dict):
                 return {k: _move_to_device(v, target_device) for k, v in obj.items()}
             if isinstance(obj, list):
