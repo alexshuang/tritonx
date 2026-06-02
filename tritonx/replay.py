@@ -122,41 +122,42 @@ class CSRMask:
         return int((pairs[:, 1] - pairs[:, 0]).sum())
 
     def __repr__(self) -> str:
-        pairs = self.indptr.reshape(-1, 2).tolist()
-        segs = ", ".join(f"[{s},{e})" for s, e in pairs)
-        return (f"CSRMask(length={self.length}, "
-                f"num_segments={self.num_segments}, "
-                f"num_true={self.num_true}, "
-                f"segments=[{segs}])")
+        return f"{self.length}xi1"
+        # return (f"CSRMask(length={self.length}, "
+        #         f"num_segments={self.num_segments}, "
+        #         f"num_true={self.num_true}, "
+        #         f"segments=[{segs}])")
 
 
 def _to_savable_obj(x: Any, move_tensor_to_cpu: bool = True,
-                    func_name: str = "", arg_name: str = ""):
+                    func_name: str = "", arg_name: str = "",
+                    compress_all: bool = True) -> Any:
     if isinstance(x, torch.Tensor):
         if torch.is_floating_point(x):
             type_str = tensor_type_str(x)
             seed = _make_deterministic_seed(func_name, arg_name, type_str)
             return FloatTensor({"type_str": type_str, "seed": seed})
         else:
-            # all same scalar
-            u = torch.unique(x)
-            if u.numel() == 1:
-                return f"{tensor_type_str(x)}={u.item()}"
+            if compress_all:
+                # all same scalar
+                u = torch.unique(x)
+                if u.numel() == 1:
+                    return f"{tensor_type_str(x)}={u.item()}"
 
-            # compress by CSR format
-            if x.dtype == torch.bool and x.dim() == 1:
-                return CSRMask.from_mask(x)
+                # compress by CSR format
+                if x.dtype == torch.bool and x.dim() == 1:
+                    return CSRMask.from_mask(x)
 
         t = x.detach()
         if move_tensor_to_cpu:
             t = t.cpu()
         return t
     elif isinstance(x, list):
-        return [_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for v in x]
+        return [_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name, compress_all) for v in x]
     elif isinstance(x, tuple):
-        return tuple(_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for v in x)
+        return tuple(_to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name, compress_all) for v in x)
     elif isinstance(x, dict):
-        return {k: _to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name) for k, v in x.items()}
+        return {k: _to_savable_obj(v, move_tensor_to_cpu, func_name, arg_name, compress_all) for k, v in x.items()}
     else:
         return x
 
@@ -176,6 +177,7 @@ def dump_inputs(
     *,
     move_tensor_to_cpu: bool = True,
     overwrite: bool = False,
+    compress_all: bool = True,
 ):
     def decorator(func):
         sig = inspect.signature(func)
@@ -197,13 +199,22 @@ def dump_inputs(
             func_name = get_func_name(func)
             file_path = os.path.join(dump_dir, f"{func_name}-{sha}.pt")
 
+            inputs = {}
+            for k, v in bound_args.items():
+                try:
+                    inputs[k] = _to_savable_obj(v, move_tensor_to_cpu, func_name, k, compress_all)
+                except Exception as e:
+                    print(f'Warning occurred {e}, trying "not move_tensor_to_cpu" again')
+                    inputs[k] = _to_savable_obj(v, not move_tensor_to_cpu, func_name, k, compress_all)
+
             torch.save(
                 {
                     "func_name": func_name,
-                    "inputs": {
-                        k: _to_savable_obj(v, move_tensor_to_cpu, func_name, k)
-                        for k, v in bound_args.items()
-                    },
+                    "inputs": inputs,
+                    # "inputs": {
+                    #     k: _to_savable_obj(v, move_tensor_to_cpu, func_name, k)
+                    #     for k, v in bound_args.items()
+                    # },
                 },
                 file_path,
             )
