@@ -7,7 +7,7 @@ import inspect
 import functools
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 from collections import defaultdict
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
@@ -429,7 +429,7 @@ def replay_inputs(
             fn = lambda: func(*args, dump=False, **kwargs) if is_dump_inputs(func) else func(*args, **kwargs)
             return fn()
 
-        def _run(file: str, device, cache_results: list = None, ref_fn: Callable = None):
+        def _run(file: str, device: str, cache_results: Union[list, str] = None, ref_fn: Callable = None):
             def _launch_enter_hook(launch_metadata):
                 metadata = launch_metadata.get() | {'input_file': file}
                 for h in _user_hooks:
@@ -499,6 +499,9 @@ def replay_inputs(
                 } for f in files
             ]
             return results
+
+        def cache_results(key: Union[list, str], device_override=None):
+            return replay_all(device_override, cache_results=key)
 
         def replay(hash_prefix: str, device_override=None, ref_fn: Callable = None):
             files = _iter_case_paths(hash_prefix)
