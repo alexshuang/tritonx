@@ -545,17 +545,24 @@ def replay_inputs(
             bench_cfgs = _build_benchmark_from_pt(pt_manifest=pt_manifest)
             os.makedirs(save_path, exist_ok=True)
 
+            compile_only = True if os.getenv("TRITON_HCUTUNE_COMPILE_ONLY", "0") == "1" else False
+            if compile_only:
+                print(f"[tritonx] HCU auto-tuning with cpu tensors on compile-only mode")
+                _device = "cpu"
+            else:
+                _device = device
+
             @perf_report(bench_cfgs)
             def _bench(**bench_kwargs):
-                inputs = _move_to_device(bench_kwargs["inputs"], device)
+                inputs = _move_to_device(bench_kwargs["inputs"], _device)
                 provider = bench_kwargs.get("provider", "triton")
-                runtime_device = bench_kwargs.get("device", device)
+                runtime_device = bench_kwargs.get("device", _device)
 
                 if provider != "triton":
                     raise ValueError(f"Only provider='triton' is supported, got {provider!r}")
-                if runtime_device != device:
+                if not compile_only and runtime_device != _device:
                     raise ValueError(
-                        f"Benchmark device mismatch: expected {device!r}, got {runtime_device!r}"
+                        f"Benchmark device mismatch: expected {_device!r}, got {runtime_device!r}"
                     )
 
                 run = lambda: func(dump=False, **inputs) if is_dump_inputs(func) else func(**inputs)
