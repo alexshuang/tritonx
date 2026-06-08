@@ -599,6 +599,7 @@ def replay_inputs(
         wrapper.benchmark = benchmark
         wrapper.get_grids_by_key = get_grids_by_key
         wrapper.prune_files_by_grids = prune_files_by_grids
+        wrapper.cache_results = cache_results
         wrapper.__decorator_name__ = "replay_inputs"
         return wrapper
 
