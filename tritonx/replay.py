@@ -11,6 +11,7 @@ from typing import Any, Callable, List, Optional, Union
 from collections import defaultdict
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
+from datetime import datetime
 
 from triton import __version__ as triton_version
 triton_major_version = int(triton_version.split(".")[0])
@@ -34,6 +35,10 @@ def get_dump_input_dir():
 
 def get_dump_output_dir():
     return os.path.join(_get_dump_dir(), "outputs")
+
+
+def get_dump_trace_dir():
+    return os.path.join(_get_dump_dir(), "trace")
 
 
 def _to_hashable_obj(x: Any):
@@ -337,6 +342,25 @@ def prune_grids(grids: list[tuple], threshold: int = 10, mode='next_power_of_2')
     return sorted(current_grids)
 
 
+def _move_to_device(obj: Any, target_device: str) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.to(target_device)
+    if isinstance(obj, str):
+        return tensor_from_type_str(obj, target_device)
+    if isinstance(obj, FloatTensor):
+        # format: {"type_str": "2x3xf32", "seed": 123}
+        return float_tensor_from_type_str(obj["type_str"], target_device, seed=obj["seed"])
+    if isinstance(obj, CSRMask):
+        return obj.to_mask().to(target_device)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, target_device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_device(v, target_device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_to_device(v, target_device) for v in obj)
+    return obj
+
+
 def replay_inputs(
     fn: Optional[Callable] = None,
     *,
@@ -369,25 +393,8 @@ def replay_inputs(
                 raise RuntimeError(f"No found {glob_expr} under {root}")
             return paths
 
-        def _move_to_device(obj: Any, target_device: str) -> Any:
-            if isinstance(obj, torch.Tensor):
-                return obj.to(target_device)
-            if isinstance(obj, str):
-                return tensor_from_type_str(obj, target_device)
-            if isinstance(obj, FloatTensor):
-                # format: {"type_str": "2x3xf32", "seed": 123}
-                return float_tensor_from_type_str(obj["type_str"], target_device, seed=obj["seed"])
-            if isinstance(obj, CSRMask):
-                return obj.to_mask().to(target_device)
-            if isinstance(obj, dict):
-                return {k: _move_to_device(v, target_device) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_move_to_device(v, target_device) for v in obj]
-            if isinstance(obj, tuple):
-                return tuple(_move_to_device(v, target_device) for v in obj)
-            return obj
-
-        def _build_benchmark_from_pt(pt_manifest: str = '') -> tt.Benchmark:
+        def _build_benchmark_from_pt(pt_manifest: str = '', flops_fn: Callable = None,
+                                     bytes_fn: Callable = None) -> tt.Benchmark:
             file_paths = [Path(o) for o in open(pt_manifest).read().splitlines()] \
                 if pt_manifest else _iter_case_paths()
 
@@ -421,6 +428,8 @@ def replay_inputs(
                 args={
                     "device": device,
                     "pt": file_paths,
+                    "flops_fn": flops_fn,
+                    "bytes_fn": bytes_fn,
                 },
             )
 
@@ -513,8 +522,14 @@ def replay_inputs(
             grids = defaultdict(set)
             def _hook(metadata):
                 args = metadata['args']
-                key = tuple([str(args[o].dtype) if hasattr(args[o], 'dtype') else args[o]
-                            for o in keys if o in args])
+                key = []
+                for k in keys:
+                    if k in args:
+                        key.append(args[k])
+                for n, arg in args.items():
+                    if hasattr(arg, "dtype"):
+                        key.append(str(arg.dtype))
+                key = tuple(key)
                 grids[key].add((metadata['input_file'], metadata['grid']))
 
             replay_all(replay_enter_hook=_hook)
@@ -544,8 +559,11 @@ def replay_inputs(
             rep: int = 100,
             quantiles: Optional[List[float]] = None,
             pt_manifest: str = '',
+            flops_fn: Callable = None,
+            bytes_fn: Callable = None,
         ):
-            bench_cfgs = _build_benchmark_from_pt(pt_manifest=pt_manifest)
+            bench_cfgs = _build_benchmark_from_pt(pt_manifest=pt_manifest, flops_fn=flops_fn,
+                                                  bytes_fn=bytes_fn)
             os.makedirs(save_path, exist_ok=True)
 
             compile_only = True if os.getenv("TRITON_HCUTUNE_COMPILE_ONLY", "0") == "1" else False
@@ -586,13 +604,46 @@ def replay_inputs(
             )
 
             if save_path:
+                _save_path = _bench._save_path if hasattr(_bench, '_save_path') else save_path
                 print('\n' + '*' * 72)
                 print('*')
-                print(f'*  Benchmark result save path: {os.path.join(save_path, f"{bench_cfgs.plot_name}.csv")}')
+                print(f'*  Benchmark result save path: {os.path.join(_save_path, f"{bench_cfgs.plot_name}.csv")}')
                 print('*')
                 print('*' * 72 + '\n')
 
             return ret
+
+        def profile(hash_prefix: str = '', backend: str = 'proton'):
+            if backend == 'proton':
+                import triton.profiler as proton
+                proton.start(func_name, backend="roctracer")
+                if hash_prefix:
+                    replay(hash_prefix)
+                else:
+                    replay_all()
+                proton.finalize()
+            elif backend == 'torch':
+                import torch
+                from torch.profiler import profile, ProfilerActivity
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    with_stack=True,
+                    record_shapes=True,
+                ) as prof:
+                    if hash_prefix:
+                        replay(hash_prefix)
+                    else:
+                        replay_all()
+
+                print(
+                    prof.key_averages(group_by_input_shape=False)
+                        .table(sort_by="cuda_time_total", row_limit=20)
+                )
+                post = datetime.now().strftime("%Y%m%d%H%M%S")
+                os.makedirs(get_dump_trace_dir(), exist_ok=True)
+                prof.export_chrome_trace(f"{get_dump_trace_dir()}/{func_name}_{post}.json")
+            else:
+                raise ValueError(f"Only backend='torch/proton' is supported, got {backend!r}")
 
         wrapper.replay_all = replay_all
         wrapper.replay = replay
@@ -600,6 +651,7 @@ def replay_inputs(
         wrapper.get_grids_by_key = get_grids_by_key
         wrapper.prune_files_by_grids = prune_files_by_grids
         wrapper.cache_results = cache_results
+        wrapper.profile = profile
         wrapper.__decorator_name__ = "replay_inputs"
         return wrapper
 
