@@ -1,9 +1,11 @@
 from .replay import dump_inputs, replay_inputs, get_dump_output_dir
+from .utils import get_peak_performance
 
 __all__ = [
     "dump_inputs",
     "replay_inputs",
     "get_dump_output_dir",
+    "get_peak_performance",
 ]
 
 

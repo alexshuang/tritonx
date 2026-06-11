@@ -576,6 +576,24 @@ def replay_inputs(
             @perf_report(bench_cfgs)
             def _bench(**bench_kwargs):
                 inputs = _move_to_device(bench_kwargs["inputs"], _device)
+                if flops_fn:
+                    try:
+                        flops, peak_flops = flops_fn(inputs)
+                    except:
+                        print("flops_fn() must return (flops, peak_flops)")
+                        raise NotImplementedError
+                else:
+                    flops, peak_flops = 0, 0
+
+                if bytes_fn:
+                    try:
+                        bytes, peak_bytes = bytes_fn(inputs)
+                    except:
+                        print("bytes_fn() must return (bytes, peak_bytes)")
+                        raise NotImplementedError
+                else:
+                    bytes, peak_bytes = 0, 0
+
                 provider = bench_kwargs.get("provider", "triton")
                 runtime_device = bench_kwargs.get("device", _device)
 
@@ -594,7 +612,7 @@ def replay_inputs(
                     q = quantiles
 
                 # return tt.do_bench(run, warmup=warmup, rep=rep, quantiles=q)
-                return tt.do_bench(run, quantiles=q)
+                return tt.do_bench(run, quantiles=q), flops, peak_flops, bytes, peak_bytes
 
             ret = _bench.run(
                 show_plots=show_plots,
