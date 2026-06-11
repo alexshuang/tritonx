@@ -44,6 +44,22 @@ DTYPE_TO_TORCH_DTYPE = {
 }
 
 
+ELEMENT_SIZE = {
+    "f32": 4,
+    "f16": 2,
+    "bf16": 2,
+    "f64": 8,
+    "f8_e4m3fn": 1,
+    "f8_e5m2": 1,
+    "i8": 1,
+    "i16": 2,
+    "i32": 4,
+    "i64": 8,
+    "u8": 1,
+    "bool": 1,
+}
+
+
 PEAK_PERF = {
     "gfx938_cu72": {
         'bf16': {
@@ -135,32 +151,25 @@ class Mark(_Mark):
             tflops, peak_tflops, flops_utilization = [], [], []
             bw, peak_bw, bw_utilization = [], [], []
             ai, compute_bound_ratio = [], []
+            print(f"benchmark {pt} ...")
             for y in bench.line_vals:
                 ret = self.fn(**{'inputs': x_args}, **{bench.line_arg: y}, **bench.args, **kwrags)
                 try:
-                    y_mean, y_min, y_max = ret
+                    (y_mean, y_min, y_max), flops, peak_flops, bytes, peak_bytes = ret
                 except TypeError:
-                    y_mean, y_min, y_max = ret, None, None
+                    y_mean, y_min, y_max, flops, peak_flops, bytes, peak_bytes = ret, None, None, 0, 0, 0, 0
                 row_mean += [y_mean]
                 row_min += [y_min]
                 row_max += [y_max]
 
-                if self.flops_fn or self.bytes_fn:
-                    from .replay import _move_to_device
-                    _x_args = _move_to_device(x_args, 'cpu')
-
                 if self.flops_fn:
-                    flops = self.flops_fn(_x_args)
                     flops_per_sec = flops / (y_mean / 1000)
-                    peak_flops = get_peak_performance(_x_args['q_extend'].dtype)['flops']
                     tflops += [flops_per_sec / 1e12]
                     peak_tflops += [peak_flops / 1e12]
                     flops_utilization += [flops_per_sec / peak_flops]
 
                 if self.bytes_fn:
-                    bytes = self.bytes_fn(_x_args)
                     bytes_per_sec = bytes / (y_mean / 1000)
-                    peak_bytes = get_peak_performance(_x_args['q_extend'].dtype)['bw']
                     bw += [bytes_per_sec / 1e12]
                     peak_bw += [peak_bytes / 1e12]
                     bw_utilization += [bytes_per_sec / peak_bytes]
