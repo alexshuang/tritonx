@@ -1,6 +1,7 @@
 import triton
 import torch
 import functools
+from pathlib import Path
 
 try:
     from triton.backends.amd.testing import MPMark as _Mark
@@ -183,7 +184,7 @@ class Mark(_Mark):
             _x = [tensor_shape_dtype_str(o) if hasattr(o, 'dtype') else
                   o.get('type_str') if isinstance(o, FloatTensor) else o
                   for o in x]
-            df.loc[len(df)] = [pt.stem] + _x + row_mean + row_min + row_max + \
+            df.loc[len(df)] = [Path(pt).stem] + _x + row_mean + row_min + row_max + \
                                 tflops + peak_tflops + flops_utilization + \
                                 bw + peak_bw + bw_utilization + ai + compute_bound_ratio
 

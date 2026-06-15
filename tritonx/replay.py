@@ -393,10 +393,27 @@ def replay_inputs(
                 raise RuntimeError(f"No found {glob_expr} under {root}")
             return paths
 
+        def _parse_pt_manifest(pt_manifest: str):
+            res = []
+            if pt_manifest:
+                manifests = pt_manifest.split(',')
+                for o in manifests:
+                    s = Path(o)
+                    if s.is_file():
+                        res.extend(s.read_text().splitlines())
+                    elif '-' not in str(s) and not s.is_absolute(): # only hash_prefix
+                        res.append(f'{get_dump_input_dir()}/{func_name}-{s}.pt')
+                    elif '.pt' in str(s) and not s.is_absolute():
+                        res.append(f'{get_dump_input_dir()}/{s}')
+                    else:
+                        res.append(str(s))
+            return res
+
         def _build_benchmark_from_pt(pt_manifest: str = '', flops_fn: Callable = None,
                                      bytes_fn: Callable = None) -> tt.Benchmark:
-            file_paths = [Path(o) for o in open(pt_manifest).read().splitlines()] \
-                if pt_manifest else _iter_case_paths()
+            file_paths = _parse_pt_manifest(pt_manifest)
+            if not file_paths:
+                file_paths = _iter_case_paths()
 
             def is_same_argument_names(lists: list[list[str]]) -> bool:
                 if not lists:
