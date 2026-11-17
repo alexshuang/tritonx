@@ -62,8 +62,8 @@ def _to_hashable_obj(x: Any):
         return {"__type__": type(x).__name__, "repr": repr(x)}
 
 
-def _compute_inputs_sha256(bound_args: dict[str, Any]) -> str:
-    obj = {k: _to_hashable_obj(v) for k, v in sorted(bound_args.items(), key=lambda kv: kv[0])}
+def _compute_inputs_sha256(bound_args: dict[str, Any], do_not_hash: list = []) -> str:
+    obj = {k: _to_hashable_obj(v) for k, v in sorted(bound_args.items(), key=lambda kv: kv[0]) if k not in do_not_hash}
     payload = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:12]
 
@@ -185,6 +185,7 @@ def dump_inputs(
     move_tensor_to_cpu: bool = True,
     overwrite: bool = False,
     compress_all: bool = True,
+    do_not_hash: list = [],
 ):
     def decorator(func):
         sig = inspect.signature(func)
@@ -199,7 +200,7 @@ def dump_inputs(
             bound.apply_defaults()
             bound_args = dict(bound.arguments)
 
-            sha = _compute_inputs_sha256(bound_args)
+            sha = _compute_inputs_sha256(bound_args, do_not_hash=do_not_hash)
 
             dump_dir = get_dump_input_dir()
             Path(dump_dir).mkdir(parents=True, exist_ok=True)
