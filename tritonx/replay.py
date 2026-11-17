@@ -7,7 +7,7 @@ import inspect
 import functools
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union, Iterable
 from collections import defaultdict
 import triton.testing as tt
 from .utils import perf_report, TORCH_DTYPE_TO_DTYPE, DTYPE_TO_TORCH_DTYPE
@@ -185,13 +185,41 @@ def dump_inputs(
     move_tensor_to_cpu: bool = True,
     overwrite: bool = False,
     compress_all: bool = True,
-    do_not_hash: list = [],
+    do_not_hash: Optional[Iterable[str]] = None,
 ):
+    if isinstance(do_not_hash, str):
+        do_not_hash = (do_not_hash,)
+    else:
+        do_not_hash = tuple(do_not_hash or ())
+
     def decorator(func):
         sig = inspect.signature(func)
+        func_name = get_func_name(func)
+        cache = set()
+        _initialized = False
+
+        unknown = set(do_not_hash) - set(sig.parameters)
+        if unknown:
+            raise ValueError(
+                f"do_not_hash of {func_name} contains unknown parameters: {sorted(unknown)}. "
+                f"Valid parameters: {list(sig.parameters)}"
+            )
+
+        def _find_cache(dump_dir: str) -> set:
+            shas = set()
+            if not os.path.isdir(dump_dir):
+                return shas
+            prefix, suffix = f"{func_name}-", ".pt"
+            for f in os.listdir(dump_dir):
+                if f.startswith(prefix) and f.endswith(suffix):
+                    sha = f[len(prefix):-len(suffix)]
+                    if sha and "-" not in sha:
+                        shas.add(sha)
+            return shas
 
         @functools.wraps(func)
         def wrapper(*args, dump=True, **kwargs):
+            nonlocal _initialized
             # @replay_inputs don't dump inputs by dump_inputs=False to avoid affecting benchmark
             if not dump:
                 return func(*args, **kwargs)
@@ -203,8 +231,18 @@ def dump_inputs(
             sha = _compute_inputs_sha256(bound_args, do_not_hash=do_not_hash)
 
             dump_dir = get_dump_input_dir()
+
+            # Initialize cache on first call to avoid scanning the directory on every call
+            if _initialized is False:
+                cache.clear()
+                cache.update(_find_cache(dump_dir))
+                _initialized = True
+
+            # cache hit, skip dumping
+            if sha in cache and not overwrite:
+                return func(*args, **kwargs)
+
             Path(dump_dir).mkdir(parents=True, exist_ok=True)
-            func_name = get_func_name(func)
             file_path = os.path.join(dump_dir, f"{func_name}-{sha}.pt")
 
             inputs = {}
@@ -215,17 +253,11 @@ def dump_inputs(
                     print(f'Warning occurred {e}, trying "not move_tensor_to_cpu" again')
                     inputs[k] = _to_savable_obj(v, not move_tensor_to_cpu, func_name, k, compress_all)
 
-            torch.save(
-                {
-                    "func_name": func_name,
-                    "inputs": inputs,
-                    # "inputs": {
-                    #     k: _to_savable_obj(v, move_tensor_to_cpu, func_name, k)
-                    #     for k, v in bound_args.items()
-                    # },
-                },
-                file_path,
-            )
+            tmp_path = f"{file_path}.tmp.{os.getpid()}"
+            torch.save({"func_name": func_name, "inputs": inputs}, tmp_path)
+            os.replace(tmp_path, file_path)
+
+            cache.add(sha)
             print(f"Dump inputs of {func_name} to {file_path}")
 
             return func(*args, **kwargs)
@@ -234,6 +266,8 @@ def dump_inputs(
         wrapper.__decorator_params__ = {
             "move_tensor_to_cpu": move_tensor_to_cpu,
             "overwrite": overwrite,
+            "compress_all": compress_all,
+            "do_not_hash": do_not_hash,
         }
         return wrapper
 
