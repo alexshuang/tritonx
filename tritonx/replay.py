@@ -435,7 +435,12 @@ def replay_inputs(
                 for o in manifests:
                     s = Path(o)
                     if s.is_file():
-                        res.extend(s.read_text().splitlines())
+                        lines = s.read_text().splitlines()
+                        for d in lines:
+                            if '.pt' in d and not Path(d).is_absolute():
+                                res.append(f'{get_dump_input_dir()}/{d}')
+                            else:
+                                res.append(d)
                     elif '-' not in str(s) and not s.is_absolute(): # only hash_prefix
                         res.append(f'{get_dump_input_dir()}/{func_name}-{s}.pt')
                     elif '.pt' in str(s) and not s.is_absolute():
